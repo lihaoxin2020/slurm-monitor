@@ -5,6 +5,8 @@ A live terminal dashboard for monitoring SLURM (sbatch) jobs. Auto-refreshes in 
 ![Python 3.6+](https://img.shields.io/badge/python-3.6%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
+![slurm-monitor dashboard](image.png)
+
 ## Features
 
 - **Live auto-refresh** — polls `squeue` every 2 seconds (configurable)
