@@ -2,6 +2,7 @@
 """
 SLURM Job Monitor — live dashboard for sbatch jobs.
 Refreshes every 2 seconds, shows running/pending jobs and tails their latest log output.
+Supports side-by-side multi-panel log view for pinned jobs.
 """
 
 import curses
@@ -61,12 +62,9 @@ def get_job_details(job_id):
 
 def find_log_file(details, job_id):
     """Try to find the stdout log file for a job."""
-    # Check scontrol output first
     stdout_path = details.get("StdOut", "")
     if stdout_path and os.path.isfile(stdout_path):
         return stdout_path
-
-    # Common patterns: slurm-<jobid>.out in home or current working dir
     work_dir = details.get("WorkDir", os.path.expanduser("~"))
     candidates = [
         os.path.join(work_dir, f"slurm-{job_id}.out"),
@@ -123,13 +121,13 @@ def get_gpu_usage(nodelist):
 
 
 STATE_LABELS = {
-    "R": ("RUNNING", 2),   # green
-    "PD": ("PENDING", 3),  # yellow
-    "CG": ("COMPLETING", 4),  # blue
+    "R": ("RUNNING", 2),
+    "PD": ("PENDING", 3),
+    "CG": ("COMPLETING", 4),
     "CD": ("COMPLETED", 4),
-    "F": ("FAILED", 1),    # red
+    "F": ("FAILED", 1),
     "TO": ("TIMEOUT", 1),
-    "CA": ("CANCELLED", 5),  # magenta
+    "CA": ("CANCELLED", 5),
     "NF": ("NODE_FAIL", 1),
     "SE": ("SPECIAL_EXIT", 1),
 }
@@ -138,6 +136,62 @@ STATE_LABELS = {
 def make_bar(pct, width=20):
     filled = int(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
+
+
+def draw_log_panel(stdscr, job_id, col_start, col_width, row_start, panel_height,
+                   scroll, log_buffer, is_active):
+    """Draw a single log panel for a pinned job. Returns nothing; modifies screen directly."""
+    details = get_job_details(job_id)
+    log_path = find_log_file(details, job_id)
+    job_name = details.get("JobName", job_id)
+
+    row = row_start
+
+    # Panel header
+    active_marker = "▶ " if is_active else "  "
+    header = f"{active_marker}{job_id}: {job_name}"
+    attr = curses.color_pair(7) | curses.A_BOLD if is_active else curses.color_pair(6) | curses.A_BOLD
+    stdscr.addnstr(row, col_start, header[:col_width], col_width, attr)
+    row += 1
+
+    # Log path
+    if row < row_start + panel_height:
+        path_display = os.path.basename(log_path) if log_path else "(no log)"
+        stdscr.addnstr(row, col_start, path_display[:col_width], col_width, curses.color_pair(6))
+        row += 1
+
+    # Log content area
+    content_height = panel_height - 2  # subtract header rows
+    if content_height <= 0:
+        return
+
+    log_lines = tail_file(log_path, n=log_buffer)
+    total_log = len(log_lines)
+
+    # Clamp scroll
+    max_scroll = max(0, total_log - content_height)
+    if scroll > max_scroll:
+        scroll = max_scroll
+    if scroll < 0:
+        scroll = 0
+
+    visible = log_lines[scroll:scroll + content_height]
+
+    # Scroll position indicator
+    if total_log > content_height and row < row_start + panel_height:
+        pos_pct = int(((scroll + content_height) / total_log) * 100) if total_log > 0 else 100
+        pos_info = f"[{scroll+1}-{min(scroll+content_height, total_log)}/{total_log} {pos_pct}%]"
+        stdscr.addnstr(row, col_start, pos_info[:col_width], col_width, curses.color_pair(3))
+        row += 1
+        content_height -= 1
+
+    for ll in visible[:content_height]:
+        if row >= row_start + panel_height:
+            break
+        stdscr.addnstr(row, col_start, ll[:col_width], col_width)
+        row += 1
+
+    return scroll  # return clamped scroll value
 
 
 def draw(stdscr):
@@ -155,9 +209,15 @@ def draw(stdscr):
     selected = 0
     show_detail = False
     show_gpu = False
+    show_split = False
     scroll_offset = 0
-    detail_scroll = 0       # scroll offset within the log tail
-    LOG_BUFFER_LINES = 500  # how many lines to read from the log
+    detail_scroll = 0
+    LOG_BUFFER_LINES = 500
+
+    # Split panel state
+    pinned_jobs = []          # list of pinned job IDs
+    panel_scrolls = {}        # job_id -> scroll offset
+    active_panel = 0          # index into pinned_jobs for which panel receives scroll input
 
     stdscr.nodelay(True)
     stdscr.timeout(REFRESH_INTERVAL * 1000)
@@ -167,11 +227,26 @@ def draw(stdscr):
         height, width = stdscr.getmaxyx()
 
         jobs = get_jobs()
+        job_ids = {j["id"] for j in jobs}
+
+        # Remove pinned jobs that no longer exist
+        pinned_jobs = [jid for jid in pinned_jobs if jid in job_ids]
+        if active_panel >= len(pinned_jobs):
+            active_panel = max(0, len(pinned_jobs) - 1)
 
         # Header
         header = f" SLURM Job Monitor — {USER} "
         ts = time.strftime("%H:%M:%S")
-        header_line = f"{header}| {len(jobs)} job(s) | {ts} | q:quit d:detail g:gpu ↑↓:select"
+        pin_count = f" pins:{len(pinned_jobs)}" if pinned_jobs else ""
+        if show_split and pinned_jobs:
+            mode = "SPLIT"
+        elif show_detail:
+            mode = "DETAIL"
+        elif show_gpu:
+            mode = "GPU"
+        else:
+            mode = "LIST"
+        header_line = f"{header}| {len(jobs)} job(s) | {ts} | [{mode}]{pin_count} | q:quit d:detail s:split p:pin g:gpu"
         stdscr.addnstr(0, 0, header_line.ljust(width), width, curses.color_pair(7) | curses.A_BOLD)
 
         if not jobs:
@@ -190,13 +265,14 @@ def draw(stdscr):
 
         # Table header
         row = 2
-        col_fmt = f"{'SEL':>3}  {'JOB ID':>10}  {'STATE':<12} {'NAME':<35} {'TIME':>10}  {'TIME LEFT':>10}  {'NODES':>5}  {'NODELIST/REASON':<25}"
+        pin_col = "PIN"
+        col_fmt = f"{pin_col:>3} {'SEL':>3}  {'JOB ID':>10}  {'STATE':<12} {'NAME':<35} {'TIME':>10}  {'TIME LEFT':>10}  {'NODES':>5}  {'NODELIST/REASON':<25}"
         stdscr.addnstr(row, 1, col_fmt[:width-2], width-2, curses.A_BOLD | curses.A_UNDERLINE)
         row += 1
 
         # Job list
         list_height = height - row - 1
-        if show_detail:
+        if show_detail or (show_split and pinned_jobs):
             list_height = min(list_height, max(6, len(jobs) + 1))
 
         # Adjust scroll
@@ -212,16 +288,62 @@ def draw(stdscr):
             st = job["state"]
             label, color = STATE_LABELS.get(st, (st, 0))
             marker = ">>" if i == selected else "  "
+            pin_marker = " * " if job["id"] in pinned_jobs else "   "
 
-            line = f"{marker:>3}  {job['id']:>10}  {label:<12} {job['name']:<35} {job['time']:>10}  {job['timeleft']:>10}  {job['nodes']:>5}  {job['nodelist']:<25}"
+            line = f"{pin_marker:>3} {marker:>3}  {job['id']:>10}  {label:<12} {job['name']:<35} {job['time']:>10}  {job['timeleft']:>10}  {job['nodes']:>5}  {job['nodelist']:<25}"
             attr = curses.color_pair(color)
             if i == selected:
                 attr |= curses.A_BOLD
             stdscr.addnstr(row, 1, line[:width-2], width-2, attr)
             row += 1
 
-        # Detail panel for selected job
-        if show_detail and row < height - 2:
+        # ── Split panel mode: side-by-side logs ──
+        if show_split and pinned_jobs and row < height - 2:
+            row += 1
+            if row < height - 1:
+                separator = "─" * (width - 4)
+                stdscr.addnstr(row, 2, separator, width - 4, curses.color_pair(6))
+                row += 1
+
+            if row < height - 1:
+                hint = "  ←/→: switch panel | j/k PgUp/PgDn: scroll | p: pin/unpin | s: exit split"
+                stdscr.addnstr(row, 2, hint[:width-4], width-4, curses.color_pair(3))
+                row += 1
+
+            panel_height = height - row
+            if panel_height < 3:
+                pass  # not enough room
+            else:
+                n_panels = len(pinned_jobs)
+                col_width = (width - 2) // n_panels
+                gap = 1  # gap between panels
+
+                for pi, jid in enumerate(pinned_jobs):
+                    c_start = 1 + pi * col_width
+                    c_w = col_width - gap if pi < n_panels - 1 else col_width
+                    is_active = (pi == active_panel)
+
+                    if jid not in panel_scrolls:
+                        panel_scrolls[jid] = 0
+
+                    clamped = draw_log_panel(
+                        stdscr, jid, c_start, c_w, row, panel_height,
+                        panel_scrolls[jid], LOG_BUFFER_LINES, is_active
+                    )
+                    if clamped is not None:
+                        panel_scrolls[jid] = clamped
+
+                    # Draw vertical separator between panels
+                    if pi < n_panels - 1:
+                        sep_col = c_start + c_w
+                        for sr in range(row, min(row + panel_height, height - 1)):
+                            try:
+                                stdscr.addch(sr, sep_col, curses.ACS_VLINE, curses.color_pair(6))
+                            except curses.error:
+                                pass
+
+        # ── Single detail panel ──
+        elif show_detail and row < height - 2:
             job = jobs[selected]
             details = get_job_details(job["id"])
             log_path = find_log_file(details, job["id"])
@@ -232,7 +354,6 @@ def draw(stdscr):
                 stdscr.addnstr(row, 2, separator, width - 4, curses.color_pair(6))
                 row += 1
 
-            # Job info line
             info_parts = []
             for key in ["JobId", "Partition", "NumCPUs", "Gres", "WorkDir"]:
                 if key in details:
@@ -246,23 +367,19 @@ def draw(stdscr):
                 stdscr.addnstr(row, 2, f"Log: {log_path}{scroll_hint}", width - 4, curses.color_pair(6))
                 row += 1
 
-            # Scrollable log view
             if row < height - 2:
                 remaining = height - row - 1
                 log_lines = tail_file(log_path, n=LOG_BUFFER_LINES)
                 total_log = len(log_lines)
 
-                # Clamp detail_scroll
                 max_scroll = max(0, total_log - remaining)
                 if detail_scroll > max_scroll:
                     detail_scroll = max_scroll
                 if detail_scroll < 0:
                     detail_scroll = 0
 
-                # Slice the visible window
                 visible = log_lines[detail_scroll:detail_scroll + remaining]
 
-                # Show scroll position indicator
                 if row < height - 1 and total_log > remaining:
                     pos_pct = int(((detail_scroll + remaining) / total_log) * 100) if total_log > 0 else 100
                     pos_info = f"── lines {detail_scroll+1}-{min(detail_scroll+remaining, total_log)} of {total_log} ({pos_pct}%) ──"
@@ -276,8 +393,8 @@ def draw(stdscr):
                     stdscr.addnstr(row, 4, ll[:width-6], width-6)
                     row += 1
 
-        # GPU panel
-        if show_gpu and not show_detail and row < height - 2:
+        # ── GPU panel ──
+        elif show_gpu and row < height - 2:
             job = jobs[selected]
             row += 1
             if row < height - 1:
@@ -303,7 +420,7 @@ def draw(stdscr):
 
         stdscr.refresh()
 
-        # Input handling
+        # ── Input handling ──
         key = stdscr.getch()
         if key == ord("q"):
             break
@@ -311,7 +428,7 @@ def draw(stdscr):
             prev = selected
             selected = max(0, selected - 1)
             if selected != prev:
-                detail_scroll = 0  # reset log scroll when switching jobs
+                detail_scroll = 0
         elif key == curses.KEY_DOWN:
             prev = selected
             selected = min(len(jobs) - 1, selected + 1)
@@ -320,19 +437,71 @@ def draw(stdscr):
         elif key == ord("d"):
             show_detail = not show_detail
             show_gpu = False
+            show_split = False
             detail_scroll = 0
         elif key == ord("g"):
             show_gpu = not show_gpu
             show_detail = False
-        # Detail panel scrolling
-        elif key == curses.KEY_PPAGE or key == ord("k"):  # Page Up / k
-            detail_scroll = max(0, detail_scroll - 10)
-        elif key == curses.KEY_NPAGE or key == ord("j"):  # Page Down / j
-            detail_scroll += 10
+            show_split = False
+        elif key == ord("s"):
+            # Toggle split view
+            if show_split:
+                show_split = False
+            else:
+                show_split = True
+                show_detail = False
+                show_gpu = False
+                # Auto-pin current job if nothing pinned
+                if not pinned_jobs and jobs:
+                    pinned_jobs.append(jobs[selected]["id"])
+                    panel_scrolls[jobs[selected]["id"]] = 0
+        elif key == ord("p"):
+            # Pin/unpin the currently selected job
+            if jobs:
+                jid = jobs[selected]["id"]
+                if jid in pinned_jobs:
+                    pinned_jobs.remove(jid)
+                    panel_scrolls.pop(jid, None)
+                else:
+                    pinned_jobs.append(jid)
+                    panel_scrolls[jid] = 0
+                # If we just pinned and only have 1, auto-enter split mode
+                if len(pinned_jobs) >= 2 and not show_split:
+                    show_split = True
+                    show_detail = False
+                    show_gpu = False
+        # Panel navigation (split mode)
+        elif key == curses.KEY_LEFT:
+            if show_split and pinned_jobs:
+                active_panel = max(0, active_panel - 1)
+        elif key == curses.KEY_RIGHT:
+            if show_split and pinned_jobs:
+                active_panel = min(len(pinned_jobs) - 1, active_panel + 1)
+        # Scrolling — routes to active panel in split mode or detail_scroll in detail mode
+        elif key == curses.KEY_PPAGE or key == ord("k"):
+            if show_split and pinned_jobs:
+                jid = pinned_jobs[active_panel]
+                panel_scrolls[jid] = max(0, panel_scrolls.get(jid, 0) - 10)
+            else:
+                detail_scroll = max(0, detail_scroll - 10)
+        elif key == curses.KEY_NPAGE or key == ord("j"):
+            if show_split and pinned_jobs:
+                jid = pinned_jobs[active_panel]
+                panel_scrolls[jid] = panel_scrolls.get(jid, 0) + 10
+            else:
+                detail_scroll += 10
         elif key == curses.KEY_HOME:
-            detail_scroll = 0
+            if show_split and pinned_jobs:
+                jid = pinned_jobs[active_panel]
+                panel_scrolls[jid] = 0
+            else:
+                detail_scroll = 0
         elif key == curses.KEY_END:
-            detail_scroll = 999999  # will be clamped
+            if show_split and pinned_jobs:
+                jid = pinned_jobs[active_panel]
+                panel_scrolls[jid] = 999999
+            else:
+                detail_scroll = 999999
 
 
 def main():
